@@ -38,6 +38,7 @@ This will result in a `k6` binary in the current directory.
 import celery from 'k6/x/celery';
 
 // Create a new Celery Redis Client
+// No worker are spawned. We are running in client-only mode.
 const client = new celery.Redis({
   url: "redis://127.0.0.1:6379",
   queue: "taskqueue",
