@@ -2,14 +2,15 @@ package celery
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/dop251/goja"
-	"github.com/gocelery/gocelery"
-	"github.com/gomodule/redigo/redis"
+	"github.com/redis/go-redis/v9"
+	"github.com/sirupsen/logrus"
 	"go.k6.io/k6/js/common"
 	"go.k6.io/k6/js/modules"
 )
@@ -60,6 +61,7 @@ type (
 		vu modules.VU
 		// Celery is the exported module instance.
 		*Celery
+		logger logrus.FieldLogger
 	}
 )
 
@@ -77,14 +79,16 @@ func New() *CeleryModule {
 // NewModuleInstance implements the modules.Module interface and returns
 // a new instance for each VU.
 func (*CeleryModule) NewModuleInstance(vu modules.VU) modules.Instance {
-	return &CeleryInstance{vu: vu, Celery: &Celery{vu: vu}}
+
+	logger := vu.InitEnv().Logger.WithField("component", "xk6-celery")
+	return &CeleryInstance{vu: vu, Celery: &Celery{vu: vu}, logger: logger}
 }
 
 // Celery is the exported module instance.
 type Celery struct {
 	vu               modules.VU
-	client           *gocelery.CeleryClient
-	backend          *gocelery.RedisCeleryBackend
+	client           ICeleryClient
+	backend          *redis.Client
 	queue            string
 	timeout          time.Duration
 	getRetryInterval time.Duration
@@ -110,45 +114,18 @@ func (mi *CeleryInstance) NewCeleryRedis(call goja.ConstructorCall) *goja.Object
 		common.Throw(rt, fmt.Errorf("invalid options; reason: %w", err))
 	}
 
-	// TODO: Set dedicated opts for redis pool config
-	redisPool := &redis.Pool{
-		MaxIdle:     2,
-		MaxActive:   0,
-		IdleTimeout: 30 * time.Second,
-		Dial: func() (redis.Conn, error) {
-			c, err := redis.DialURL(opts.Url)
-			if err != nil {
-				return nil, err
-			}
-			return c, err
-		},
-		TestOnBorrow: func(c redis.Conn, t time.Time) error {
-			if time.Since(t) < 20*time.Second {
-				return nil
-			}
-			_, err := c.Do("PING")
-			return err
-		},
+	mi.logger.Infof("configuration %+v", opts)
+
+	redisClient := NewRedisClient(opts)
+	client, err := newCeleryClient(redisClient)
+	if err != nil {
+		common.Throw(rt, fmt.Errorf("fail to innstanciate celery client; reason: %w", err))
 	}
-
-	// create RedisBroker
-	redisBroker := gocelery.NewRedisBroker(redisPool)
-	redisBroker.QueueName = opts.Queue
-
-	// create RedisBackend
-	redisBackend := &gocelery.RedisCeleryBackend{Pool: redisPool}
-
-	// initialize celery client with 0 attached worker (client-only mode)
-	c, err := gocelery.NewCeleryClient(
-		redisBroker,
-		redisBackend,
-		0,
-	)
 
 	CeleryClient := &Celery{
 		vu:               mi.vu,
-		client:           c,
-		backend:          redisBackend,
+		client:           client,
+		backend:          redisClient,
 		queue:            opts.Queue,
 		timeout:          opts.Timeout.Duration,
 		getRetryInterval: opts.GetRetryInterval.Duration,
@@ -159,6 +136,8 @@ func (mi *CeleryInstance) NewCeleryRedis(call goja.ConstructorCall) *goja.Object
 
 type options struct {
 	Url              string   `json:"url,omitempty"`
+	SentinelAddrs    []string `json:"addrs,omitempty"`
+	MasterName       string   `json:"mastername,omitempty"`
 	Queue            string   `json:"queue,omitempty"`
 	Timeout          Duration `json:"timeout,omitempty"`
 	GetRetryInterval Duration `json:"getinterval,omitempty"`
@@ -171,6 +150,9 @@ func (o *options) applyDefaults() {
 
 	if o.Queue == "" {
 		o.Queue = "celery"
+	}
+	if o.MasterName == "" {
+		o.MasterName = "default-master"
 	}
 
 	if o.Timeout.Duration == 0 {
@@ -193,6 +175,9 @@ func (o *options) validate() error {
 
 	if o.Url == "" {
 		return fmt.Errorf("celery endpoint URL cannot be empty")
+	}
+	if len(o.SentinelAddrs) >= 0 && o.MasterName == "" {
+		return fmt.Errorf("celery endpoint redis MasterName cannot be empty")
 	}
 
 	return nil
@@ -224,14 +209,19 @@ func newOptionsFrom(argument map[string]interface{}) (*options, error) {
 // Submits a new task to celery broker
 // It only supports args (no kwargs)
 func (c *Celery) Delay(taskName string, args ...interface{}) (string, error) {
-	asyncResult, err := c.client.Delay(taskName, args...)
-	return asyncResult.TaskID, err
+	ctx := context.Background()
+	taskId, err := c.client.Delay(ctx, taskName, c.queue, args)
+	if err != nil {
+		return "", err
+	}
+	return taskId, nil
 }
 
 // Check if task result is filled or still empty
 // It's a sync call with instant result.
 func (c *Celery) TaskCompleted(taskID string) (bool, error) {
-	result, err := c.backend.GetResult(taskID)
+	ctx := context.Background()
+	result, err := c.client.GetResult(ctx, taskID)
 	if err != nil {
 		if err.Error() == "result not available" { // error message is hardcoded in client lib
 			return false, nil

@@ -1,6 +1,6 @@
 # xk6-celery
 A simple Celery tasks submitter/checker extension for k6.
-It relies on `github.com/gocelery/gocelery` library & use redis connection pooling at K6 object level.
+It relies on `github.com/redis/go-redis/v9` library & use redis connection pooling at K6 object level.
 
 ## Known current limitations
 * This extension is only meant to sumbit Celery tasks and (eventually) check task completion.
@@ -42,6 +42,8 @@ import celery from 'k6/x/celery';
 const client = new celery.Redis({
   url: "redis://127.0.0.1:6379",
   queue: "taskqueue",
+  // sentinelAddrs: ["sentinel1:26379","sentinel2:26379"],
+  // mastername: "default-master",
 });
 
 // Publish a new task with a three positional arguments
